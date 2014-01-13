@@ -394,3 +394,5 @@ device		virtio_blk
 device		virtio_balloon
 device		vtnet
 device		virtio_scsi
+
+device		hyperv		# HyperV drivers
