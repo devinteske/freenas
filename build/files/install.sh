@@ -11,6 +11,18 @@ TERM=${TERM:-cons25}
 export TERM
 
 . /etc/avatar.conf
+. /usr/share/bsdconfig/struct.subr
+
+# GEOM structure definitions
+f_struct_define GEOM_CLASS id name ngeoms
+f_struct_define GEOM_GEOM class_ref config id name nconsumers nproviders rank
+f_struct_define GEOM_GEOM_CONFIG entries first fwheads fwsectros last \
+    modified scheme state
+f_struct_define GEOM_CONSUMER geom_ref config id mode provider_ref
+f_struct_define GEOM_PROVIDER geom_ref config id mode name mediasize \
+    sectorsize stripeoffset stripesize
+f_struct_define GEOM_PROVIDER_CONFIG descr file fwheads fwsectors ident \
+    length type unit
 
 is_truenas()
 {
@@ -100,6 +112,86 @@ wait_keypress()
     read -p "Press ENTER to continue." _tmp
 }
 
+parse_kern_geom_confxml()
+{
+    eval "$( sysctl -n kern.geom.confxml | awk '
+    BEGIN {
+        struct_count["class"] = 0
+        struct_count["geom"] = 0
+        struct_count["consumer"] = 0
+        struct_count["provider"] = 0
+    }
+    ############################################### FUNCTIONS
+    function set_value(prop, value)
+    {
+        if (!struct_stack[cur_struct]) return failure
+        printf "%s set %s \"%s\"\n", struct_stack[cur_struct], prop, value
+    }
+    function create(type, id)
+    {
+        if (struct = created[type "_" id]) {
+            print "f_struct_free", struct
+            print "f_struct_new GEOM_" toupper(type), struct
+        } else {
+            struct = struct_stack[cur_struct]
+            struct = struct ( struct ? "" : "geom" )
+            struct = struct "_" type "_" ++struct_count[type]
+            print "f_struct_new GEOM_" toupper(type), struct
+        }
+        struct_stack[++cur_struct] = struct
+        set_value("id", id)
+    }
+    function extract_attr(field, attr)
+    {
+        if (match(field, attr "=\"0x[[:xdigit:]]+\"")) {
+            len = length(attr)
+            return substr($2, len + 3, RLENGTH - len - 3)
+        }
+    }
+    function extract_data(type)
+    {
+        data = $0
+        sub("^[[:space:]]*<" type ">", "", data)
+        sub("</" type ">.*$", "", data)
+        return data
+    }
+    ############################################### OPENING PATTERNS
+    $1 ~ /^<mesh/ { mesh = 1 }
+    $1 ~ /^<(class|geom|consumer|provider)$/ && mesh {
+        if ((ref = extract_attr($2, "ref")) != "")
+            set_value(substr($1, 2) "_ref", ref)
+        else if ((id = extract_attr($2, "id")) != "")
+            create(substr($1, 2), id)
+    }
+    ############################################### PROPERTIES
+    $1 ~ /^<[[:alnum:]]+>/ {
+        prop = $1
+        sub(/^</, "", prop); sub(/>.*/, "", prop)
+        set_value(prop, extract_data(prop))
+    }
+    ############################################### CLOSING PATTERNS
+    $1 ~ "^</(consumer|provider)>$" { cur_struct-- }
+    $1 == "</geom>" {
+        set_value("nconsumers", struct_count["consumer"])
+        set_value("nproviders", struct_count["provider"])
+        cur_struct--
+        struct_count["consumer"] = 0
+        struct_count["provider"] = 0
+    }
+    $1 == "</class>" {
+        set_value("ngeoms", struct_count["geom"])
+        cur_struct--
+        struct_count["consumer"] = 0
+        struct_count["provider"] = 0
+        struct_count["geom"] = 0
+    }
+    $1 == "</mesh>" {
+        printf "NGEOM_CLASSES=%u\n", struct_count["class"]
+        delete struct_count
+        mesh = 0
+    }' )"
+}
+
 get_physical_disks_list()
 {
     VAL=`sysctl -n kern.disks | tr ' ' '\n'| grep -v '^cd' \
@@ -112,25 +204,101 @@ get_media_description()
     local _media
     local _description
     local _cap
+    local _c
+    local _name
+    local _ngeoms
+    local _g
+    local _provider_ref
+    local _nproviders
+    local _p
+    local _id
+    local _mediasize
 
     _media=$1
     VAL=""
-    if [ -n "${_media}" ]; then
-        _description=`pc-sysinstall disk-list -c |grep "^${_media}"\
-            | awk -F':' '{print $2}'|sed -E 's|.*<(.*)>.*$|\1|'`
-        _cap=`diskinfo ${_media} | awk '{
-            capacity = $3;
-            if (capacity >= 1099511627776) {
-                printf("%.1f TiB", capacity / 1099511627776.0);
-            } else if (capacity >= 1073741824) {
-                printf("%.1f GiB", capacity / 1073741824.0);
-            } else if (capacity >= 1048576) {
-                printf("%.1f MiB", capacity / 1048576.0);
-            } else {
-                printf("%d Bytes", capacity);
-        }}'`
-        VAL="${_description} -- ${_cap}"
+    export VAL
+
+    [ -n "$_media" ] || return 0
+
+    _description=`pc-sysinstall disk-list -c |grep "^${_media}"\
+        | awk -F':' '{print $2}'|sed -E 's|.*<(.*)>.*$|\1|'`
+
+    # Find GEOM_CLASS with name of ``DEV''
+    _c=1
+    _ngeoms=0
+    while [ $_c -le ${NGEOM_CLASSES:-0} ]; do
+        geom_class_$_c get name _name
+        if [ "$_name" = "DEV" ]; then
+            geom_class_$_c get ngeoms _ngeoms
+            break
+        fi
+        _c=$(( $_c + 1 ))
+    done
+    # Find GEOM_GEOM with name of ``$_media'' and get provider_ref
+    _g=1
+    _provider_ref=
+    while [ $_g -lt $_ngeoms ]; do
+        geom_class_${_c}_geom_$_g get name _name
+        if [ "$_name" = "$_media" ]; then
+            geom_class_${_c}_geom_${_g}_consumer_1 \
+                get provider_ref _provider_ref
+            break
+        fi
+        _g=$(( $_g + 1 ))
+    done
+    # Find GEOM_PROVIDER with id of ``$_provider_ref'' and get mediasize
+    _c=1
+    _mediasize=
+    if [ -n "$_provider_ref" ]; then
+        while [ $_c -le ${NGEOM_CLASSES:-0} ]; do
+            geom_class_$_c get name _name
+            case "$_name" in
+            MD|DISK|LABEL|PART)
+                geom_class_$_c get ngeoms _ngeoms ;;
+            *)
+                _c=$(( $_c + 1 ))
+                continue
+            esac
+            _g=1
+            while [ $_g -le $_ngeoms ]; do
+                _p=1
+                geom_class_${_c}_geom_$_g get nproviders _nproviders
+                while [ $_p -le $_nproviders ]; do
+                    geom_class_${_c}_geom_${_g}_provider_$_p get id _id
+                    if [ "$_id" = "$_provider_ref" ]; then
+                        geom_class_${_c}_geom_${_g}_provider_$_p \
+                            get mediasize _mediasize
+                        break
+                    fi
+                    _p=$(( $_p + 1 ))
+                done
+                [ -n "$_mediasize" ] && break
+                _g=$(( $_g + 1 ))
+            done
+            [ -n "$_mediasize" ] && break
+            _c=$(( $_c + 1 ))
+        done
     fi
+
+    _cap=$(
+    ( if [ "$_mediasize" ]; then
+        echo $_media 0 $_mediasize
+      else
+        diskinfo $_media
+      fi
+    ) | awk '{
+        capacity = $3;
+        if (capacity >= 1099511627776)
+            printf("%.1f TiB", capacity / 1099511627776.0);
+        else if (capacity >= 1073741824)
+            printf("%.1f GiB", capacity / 1073741824.0);
+        else if (capacity >= 1048576)
+            printf("%.1f MiB", capacity / 1048576.0);
+        else
+            printf("%d Bytes", capacity);
+    }' )
+
+    VAL="$_description -- $_cap"
     export VAL
 }
 
@@ -531,6 +699,7 @@ main()
         _test_option="5 Test"
     fi
 
+    parse_kern_geom_confxml
     while :; do
 
         dialog --clear --title "$AVATAR_PROJECT $AVATAR_VERSION Console Setup" --menu "" 12 73 6 \
